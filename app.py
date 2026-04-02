@@ -1,39 +1,52 @@
 import sys
 import os
+import datetime
+
+# Добавляем путь к текущей директории для надёжного импорта
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from database import db, init_db
-#from models import User, Message
+from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from openai import OpenAI
-import os, re, hashlib, time
-from datetime import datetime
-from database import db
-from datetime import datetime
 
+# Загрузка переменных окружения
+load_dotenv()
+
+app = Flask(__name__)
+
+# Настройки БД
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'fallback_secret_key')
+
+# Инициализация БД (привязываем сразу к app)
+db = SQLAlchemy(app)
+
+# Включаем CORS для фронтенда
+CORS(app)
+
+# ================= МОДЕЛИ =================
 class User(db.Model):
     __tablename__ = 'users'
-    
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
     contact = db.Column(db.String(255), nullable=False)
     contact_type = db.Column(db.String(20), nullable=False)
     age = db.Column(db.Integer, nullable=False)
-    occupation = db.Column(db.String(20), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
+    occupation = db.Column(db.String(50), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     messages = db.relationship('Message', backref='user', lazy=True)
 
 class Message(db.Model):
     __tablename__ = 'messages'
-    
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     role = db.Column(db.String(10), nullable=False)
     content = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
     def to_dict(self):
         return {
             'id': self.id,
@@ -43,116 +56,93 @@ class Message(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
-load_dotenv()
-app = Flask(__name__)
-CORS(app)
-#init_db(app)
+# Создание таблиц при первом запуске
+with app.app_context():
+    db.create_all()
 
-# Безопасное создание таблиц (не роняет Passenger, если БД занята)
-try:
-    with app.app_context():
-        db.create_all()
-except Exception as e:
-    print(f"[DB Warning] Tables creation skipped: {e}")
+# Инициализация OpenAI
+client = OpenAI(api_key=os.getenv('VSELLM_API_KEY'))
 
-SYSTEM_PROMPT = """Ты — Игорь Ильин, психолог с чувством юмора.
-Стиль: тёплый, мужской взгляд, лёгкая ирония без сарказма.
-Структура ответа:
-1. Выслушать и валидировать чувства
-2. Поделиться метафорой или историей
-3. Дать 2-3 конкретных простых шага
-4. Вселить надежду
-5. Предложить продолжение диалога
-ВАЖНО: Не ставь диагнозы. При кризисных словах — дай контакты доверия.
-ДИСКЛЕЙМЕР в конце: «Это не замена профессиональной терапии. В кризисной ситуации: 8-800-2000-122»"""
-
-CRISIS_KEYWORDS = ['суицид','смерть','убить','умереть','не хочу жить','ненавижу себя','повеситься','порезать']
-
-def check_crisis(text):
-    t = text.lower()
-    return any(k in t for k in CRISIS_KEYWORDS)
-
-def anonymize(text):
-    text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[email]', text)
-    text = re.sub(r'\+?[\d\s\-\(\)]{10,}', '[phone]', text)
-    return text
-
-def detect_complexity(question):
-    q = question.lower()
-    if check_crisis(q): return 'crisis'
-    complex_topics = ['психическое расстройство','клиническая депрессия','биполярное','ОКР','ПТСР','шизофрения']
-    if any(t in q for t in complex_topics): return 'complex'
-    return 'simple'
+# ================= РОУТЫ =================
 
 @app.route('/api/health', methods=['GET'])
-def health():
-    return jsonify({'status':'ok','message':'Igor Ilyin AI is running'})
+def health_check():
+    return jsonify({'message': 'Igor Ilyin AI is running', 'status': 'ok'})
 
 @app.route('/api/register', methods=['POST'])
 def register():
-    try:
-        data = request.get_json()
-        user = User(
-            name=data['name'], contact=data['contact'], contact_type=data['contact_type'],
-            age=data['age'], occupation=data['occupation']
-        )
-        db.session.add(user); db.session.commit()
-        return jsonify({'success':True,'user_id':user.id})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success':False,'error':str(e)}), 400
+    data = request.json
+    if not data:
+        return jsonify({'success': False, 'error': 'Отсутствует тело запроса'}), 400
+    
+    required = ['name', 'contact', 'contact_type', 'age', 'occupation']
+    if not all(k in data and str(data[k]).strip() for k in required):
+        return jsonify({'success': False, 'error': 'Заполните все поля'}), 400
 
-@app.route('/api/ask', methods=['POST'])
-def ask():
+    new_user = User(
+        name=str(data['name']).strip(),
+        contact=str(data['contact']).strip(),
+        contact_type=str(data['contact_type']).strip(),
+        age=int(data['age']),
+        occupation=str(data['occupation']).strip()
+    )
     try:
-        data = request.get_json()
-        user_id, question = data.get('user_id'), data.get('question')
-        if not user_id or not question:
-            return jsonify({'success':False,'error':'user_id и question обязательны'}), 400
-        
-        user = User.query.get(user_id)
-        if not user or not user.is_active:
-            return jsonify({'success':False,'error':'Пользователь не найден'}), 404
-        
-        history = Message.query.filter_by(user_id=user_id).order_by(Message.created_at.desc()).limit(20).all()
-        history.reverse()
-        history_text = "\n".join([f"{'Пользователь' if m.role=='user' else 'Игорь Ильин'}: {m.content}" for m in history])
-        
-        complexity = detect_complexity(question)
-        if complexity == 'crisis':
-            answer = "Я слышу, что тебе очень тяжело. Пожалуйста, обратись за профессиональной помощью прямо сейчас. Телефон доверия: 8-800-2000-122 (бесплатно, анонимно, круглосуточно). Ты не один."
-        else:
-            user_ctx = f"Пол: {user.gender if hasattr(user,'gender') else 'не указан'}, Возраст: {user.age}, Занятие: {user.occupation}"
-            full_prompt = f"{SYSTEM_PROMPT}\n\nДАННЫЕ ПОЛЬЗОВАТЕЛЯ:\n{user_ctx}\n\nИСТОРИЯ ДИАЛОГА:\n{history_text}\n\nВОПРОС: {anonymize(question)}"
-            
-            response = client.chat.completions.create(
-                model="qwen/qwen3.5-plus",
-                messages=[{"role":"user","content":full_prompt}],
-                temperature=0.7, max_tokens=1000, timeout=30
-            )
-            answer = response.choices[0].message.content.strip()
-            if check_crisis(answer):
-                answer += "\n\n⚠️ Если ситуация критическая: 8-800-2000-122"
-        
-        db.session.add_all([
-            Message(user_id=user_id, role='user', content=question, is_crisis=(complexity=='crisis')),
-            Message(user_id=user_id, role='assistant', content=answer)
-        ])
+        db.session.add(new_user)
         db.session.commit()
-        return jsonify({'success':True,'answer':answer,'complexity':complexity})
+        return jsonify({'success': True, 'user_id': new_user.id}), 201
     except Exception as e:
         db.session.rollback()
-        app.logger.error(f"Ask error: {e}")
-        return jsonify({'success':False,'error':'Ошибка обработки запроса'}), 500
+        return jsonify({'success': False, 'error': 'Ошибка сохранения пользователя'}), 500
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    data = request.json
+    user_id = data.get('user_id')
+    message = data.get('message')
+
+    if not user_id or not message:
+        return jsonify({'success': False, 'error': 'user_id и message обязательны'}), 400
+
+    # Сохраняем сообщение пользователя
+    user_msg = Message(user_id=user_id, role='user', content=str(message).strip())
+    db.session.add(user_msg)
+    db.session.commit()
+
+    # Получаем историю для контекста (последние 10 сообщений)
+    history = Message.query.filter_by(user_id=user_id).order_by(Message.created_at.desc()).limit(10).all()
+    history.reverse()
+    context = [{"role": m.role, "content": m.content} for m in history]
+
+    # Запрос к AI
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # Замени на свою модель, если нужно
+            messages=[
+                {"role": "system", "content": "Ты - эмпатичный психолог-консультант. Отвечай на русском языке, поддерживай, задавай уточняющие вопросы, не давай медицинских диагнозов."},
+                *context
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        ai_reply = response.choices[0].message.content.strip()
+    except Exception as e:
+        ai_reply = "Извините, сейчас возникла техническая ошибка. Попробуйте отправить сообщение позже."
+
+    # Сохраняем ответ AI
+    ai_msg = Message(user_id=user_id, role='assistant', content=ai_reply)
+    db.session.add(ai_msg)
+    db.session.commit()
+
+    return jsonify({'success': True, 'response': ai_reply})
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
     user_id = request.args.get('user_id')
-    if not user_id: return jsonify({'success':False,'error':'user_id обязателен'}), 400
+    if not user_id:
+        return jsonify({'success': False, 'error': 'user_id обязателен'}), 400
+        
     messages = Message.query.filter_by(user_id=user_id).order_by(Message.created_at.desc()).limit(20).all()
     messages.reverse()
-    return jsonify({'success':True,'messages':[m.to_dict() for m in messages]})
+    return jsonify({'success': True, 'messages': [m.to_dict() for m in messages]})
 
-#if __name__ == '__main__':
-    #port = int(os.environ.get('PORT', 5000))
-    #app.run(host='0.0.0.0', port=port)
+# ⚠️ app.run() ЗДЕСЬ НЕТ. Gunicorn запустит приложение сам.
