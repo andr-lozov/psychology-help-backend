@@ -1,0 +1,7 @@
+Flask==2.3.3
+Flask-SQLAlchemy==3.1.1
+Flask-Migrate==4.0.5
+pymysql==1.1.0
+python-dotenv==1.0.0
+requests==2.31.0
+openai==1.12.0
